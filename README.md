@@ -1,5 +1,5 @@
-<img width="1061" height="1024" alt="IMG_6112 1@1x" src="https://github.com/user-attachments/assets/7a0ceb2c-3589-44f6-9fb6-64c90822e003" />
- #CardieTalkie
+<img width="520" height="520" alt="IMG_6112 1@1x" src="https://github.com/user-attachments/assets/7a0ceb2c-3589-44f6-9fb6-64c90822e003" />
+# CardieTalkie
 
 CardieTalkie is a walkie-talkie app for Cardputer and Cardputer ADV based on ESP-NOW. It supports P2P PCM U8 mono audio communication. Text messages are stored in RAM only.
 
