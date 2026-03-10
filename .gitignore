@@ -1,0 +1,12 @@
+.DS_Store
+.idea/
+.vscode/
+.venv/
+.pio/
+.pio-core/
+__pycache__/
+*.pyc
+*.elf
+*.map
+.sconsign*.dblite
+
