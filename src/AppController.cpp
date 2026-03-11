@@ -31,6 +31,7 @@ bool AppController::begin() {
     Serial.println("[app] board init failed");
     return false;
   }
+  profile_ = board_.profile();
   if (!radio_.begin(profile_)) {
     Serial.println("[app] radio init failed");
     return false;
@@ -114,6 +115,18 @@ const AppController::Conversation* AppController::findConversation(
   return nullptr;
 }
 
+int AppController::conversationIndex(const uint8_t* macAddress) const {
+  if (macAddress == nullptr) {
+    return -1;
+  }
+  for (std::size_t i = 0; i < config::kMaxPeers; ++i) {
+    if (conversations_[i].occupied && mac::equals(conversations_[i].mac, macAddress)) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
 AppController::Conversation* AppController::ensureConversation(
     const uint8_t* macAddress, const char* peerName, uint32_t nowMs) {
   if (macAddress == nullptr) {
@@ -161,7 +174,9 @@ void AppController::appendConversationEntry(const uint8_t* macAddress,
                                             const char* text, bool fromLocal,
                                             bool quickMessage,
                                             uint8_t quickIndex,
-                                            uint32_t nowMs) {
+                                            uint32_t nowMs,
+                                            DeliveryState deliveryState,
+                                            uint16_t sequence) {
   auto* conversation = ensureConversation(macAddress, peerName, nowMs);
   if (conversation == nullptr || text == nullptr) {
     return;
@@ -173,6 +188,8 @@ void AppController::appendConversationEntry(const uint8_t* macAddress,
   entry.fromLocal = fromLocal;
   entry.quickMessage = quickMessage;
   entry.quickIndex = quickIndex;
+  entry.deliveryState = deliveryState;
+  entry.sequence = sequence;
   strncpy(entry.text, text, sizeof(entry.text) - 1);
   entry.text[sizeof(entry.text) - 1] = '\0';
 
@@ -185,16 +202,120 @@ void AppController::appendConversationEntry(const uint8_t* macAddress,
   conversation->unread = !fromLocal;
 }
 
+void AppController::updateConversationEntryDelivery(uint8_t conversationIndex,
+                                                    uint8_t entryIndex,
+                                                    DeliveryState deliveryState) {
+  if (conversationIndex >= config::kMaxPeers ||
+      entryIndex >= config::kChatHistoryLength) {
+    return;
+  }
+  auto& conversation = conversations_[conversationIndex];
+  if (!conversation.occupied) {
+    return;
+  }
+  auto& entry = conversation.entries[entryIndex];
+  if (!entry.occupied || !entry.fromLocal) {
+    return;
+  }
+  entry.deliveryState = deliveryState;
+}
+
+void AppController::clearPendingReliable() {
+  pendingReliable_ = {};
+}
+
+void AppController::failPendingReliable(uint32_t nowMs) {
+  if (!pendingReliable_.active) {
+    return;
+  }
+  updateConversationEntryDelivery(pendingReliable_.conversationIndex,
+                                  pendingReliable_.entryIndex,
+                                  DeliveryState::kFailed);
+  setInlineNotice("DELIVERY FAIL", nowMs);
+  clearPendingReliable();
+}
+
+bool AppController::isReliableDuplicate(const uint8_t* senderMac,
+                                        protocol::PacketType packetType,
+                                        uint16_t sequence,
+                                        uint32_t nowMs) const {
+  for (const auto& entry : recentReliable_) {
+    if (!entry.valid || entry.expiresAtMs < nowMs) {
+      continue;
+    }
+    if (entry.packetType == packetType && entry.sequence == sequence &&
+        mac::equals(entry.senderMac, senderMac)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void AppController::rememberReliableMessage(const uint8_t* senderMac,
+                                            protocol::PacketType packetType,
+                                            uint16_t sequence,
+                                            uint32_t nowMs) {
+  RecentReliableMessage* candidate = nullptr;
+  for (auto& entry : recentReliable_) {
+    if (!entry.valid || entry.expiresAtMs < nowMs) {
+      candidate = &entry;
+      break;
+    }
+    if (candidate == nullptr || entry.expiresAtMs < candidate->expiresAtMs) {
+      candidate = &entry;
+    }
+  }
+  if (candidate == nullptr) {
+    return;
+  }
+  candidate->valid = true;
+  candidate->packetType = packetType;
+  mac::copy(candidate->senderMac, senderMac);
+  candidate->sequence = sequence;
+  candidate->expiresAtMs = nowMs + config::kReliableMessageDedupMs;
+}
+
+void AppController::processPendingReliable(uint32_t nowMs) {
+  if (!pendingReliable_.active || nowMs < pendingReliable_.retryAtMs) {
+    return;
+  }
+
+  ++stats_.reliableAckTimeouts;
+  if (pendingReliable_.attempts >= config::kReliableMessageMaxAttempts) {
+    failPendingReliable(nowMs);
+    return;
+  }
+
+  if (!radio_.queuePacket(pendingReliable_.targetMac, pendingReliable_.packet)) {
+    failPendingReliable(nowMs);
+    return;
+  }
+
+  ++pendingReliable_.attempts;
+  ++stats_.reliableRetries;
+  pendingReliable_.retryAtMs = nowMs + config::kReliableAckTimeoutMs;
+}
+
 void AppController::processIncoming(uint32_t nowMs) {
   ReceivedFrame frame;
   while (radio_.pollReceived(frame)) {
-    if (!protocol::isValidPacketBuffer(frame.bytes, frame.length)) {
+    const bool validCurrentPacket =
+        protocol::isValidPacketBuffer(frame.bytes, frame.length);
+    const bool legacyPresence =
+        !validCurrentPacket &&
+        protocol::isLegacyPresencePacket(frame.bytes, frame.length);
+    if (!validCurrentPacket && !legacyPresence) {
       ++stats_.malformedPackets;
       continue;
     }
 
     const auto& header = *protocol::header(frame.bytes);
     if (!protocol::isTargetForLocal(header, radio_.localMac())) {
+      continue;
+    }
+
+    if (legacyPresence) {
+      handleLegacyPresencePacket(frame, header);
       continue;
     }
 
@@ -209,6 +330,9 @@ void AppController::processIncoming(uint32_t nowMs) {
         break;
       case protocol::PacketType::kTextMessage:
         handleTextMessagePacket(frame, header);
+        break;
+      case protocol::PacketType::kAck:
+        handleAckPacket(frame, header);
         break;
       case protocol::PacketType::kControl:
         handleControlPacket(frame, header);
@@ -245,8 +369,32 @@ void AppController::handlePresencePacket(const ReceivedFrame& frame,
   }
 }
 
+void AppController::handleLegacyPresencePacket(const ReceivedFrame& frame,
+                                               const protocol::PacketHeader& header) {
+  const auto* payload = protocol::presencePayload(frame.bytes);
+  const auto boardVariant = static_cast<board::BoardVariant>(payload->boardVariant);
+  peers_.updatePeer(header.sender, payload->deviceName, boardVariant,
+                    payload->capabilityFlags, payload->batteryPercent,
+                    frame.rssi, false, frame.receivedAtMs);
+  ensureConversation(header.sender, payload->deviceName, frame.receivedAtMs);
+}
+
 void AppController::handleQuickMessagePacket(const ReceivedFrame& frame,
                                              const protocol::PacketHeader& header) {
+  const bool ackRequested =
+      (header.flags & protocol::kFlagAckRequested) != 0;
+  if (ackRequested) {
+    radio_.sendAck(header.sender, protocol::PacketType::kQuickMessage,
+                   header.sequence);
+    if (isReliableDuplicate(header.sender, protocol::PacketType::kQuickMessage,
+                            header.sequence, frame.receivedAtMs)) {
+      ++stats_.reliableDuplicates;
+      return;
+    }
+    rememberReliableMessage(header.sender, protocol::PacketType::kQuickMessage,
+                            header.sequence, frame.receivedAtMs);
+  }
+
   const auto* payload = protocol::quickMessagePayload(frame.bytes);
   const auto* peer = peers_.findPeer(header.sender, frame.receivedAtMs);
   char fallback[18];
@@ -270,6 +418,20 @@ void AppController::handleQuickMessagePacket(const ReceivedFrame& frame,
 
 void AppController::handleTextMessagePacket(const ReceivedFrame& frame,
                                             const protocol::PacketHeader& header) {
+  const bool ackRequested =
+      (header.flags & protocol::kFlagAckRequested) != 0;
+  if (ackRequested) {
+    radio_.sendAck(header.sender, protocol::PacketType::kTextMessage,
+                   header.sequence);
+    if (isReliableDuplicate(header.sender, protocol::PacketType::kTextMessage,
+                            header.sequence, frame.receivedAtMs)) {
+      ++stats_.reliableDuplicates;
+      return;
+    }
+    rememberReliableMessage(header.sender, protocol::PacketType::kTextMessage,
+                            header.sequence, frame.receivedAtMs);
+  }
+
   const auto* payload = protocol::textMessagePayload(frame.bytes);
   char text[config::kTextMessageLength + 1] = {};
   const std::size_t copyLength =
@@ -293,6 +455,33 @@ void AppController::handleTextMessagePacket(const ReceivedFrame& frame,
 
   Serial.printf("[text] %s -> %s\n", senderName, text);
   board_.beep(1500, 16);
+}
+
+void AppController::handleAckPacket(const ReceivedFrame& frame,
+                                    const protocol::PacketHeader& header) {
+  if (!pendingReliable_.active || !mac::equals(header.sender, pendingReliable_.targetMac)) {
+    return;
+  }
+
+  const auto* payload = protocol::ackPayload(frame.bytes);
+  if (payload->status != 1 ||
+      payload->ackedType != static_cast<uint8_t>(pendingReliable_.packetType) ||
+      payload->ackedSequence != pendingReliable_.sequence) {
+    return;
+  }
+
+  updateConversationEntryDelivery(pendingReliable_.conversationIndex,
+                                  pendingReliable_.entryIndex,
+                                  DeliveryState::kDelivered);
+  if (pendingReliable_.packetType == protocol::PacketType::kQuickMessage &&
+      pendingReliable_.playQuickClipOnAck) {
+    if (!audio_.requestQuickMessageClip(pendingReliable_.quickIndex)) {
+      Serial.printf("[audio] quick voice skipped for Q%u\n",
+                    static_cast<unsigned>(pendingReliable_.quickIndex + 1));
+    }
+  }
+  clearInlineNotice();
+  clearPendingReliable();
 }
 
 void AppController::handleControlPacket(const ReceivedFrame& frame,
@@ -323,6 +512,10 @@ bool AppController::sendQuickMessage(std::size_t quickIndex, uint32_t nowMs) {
   if (quickIndex >= config::kQuickMessages.size()) {
     return false;
   }
+  if (pendingReliable_.active) {
+    setInlineNotice("WAIT", nowMs);
+    return false;
+  }
 
   const auto* peer = selectedPeer(nowMs);
   if (peer == nullptr || peers_.selectedPeerLost(nowMs)) {
@@ -330,28 +523,49 @@ bool AppController::sendQuickMessage(std::size_t quickIndex, uint32_t nowMs) {
     return false;
   }
 
-  const bool sent = radio_.sendQuickMessage(peer->mac,
-                                            static_cast<uint8_t>(quickIndex),
-                                            config::kQuickMessages[quickIndex],
-                                            false);
-  if (!sent) {
+  protocol::QuickMessagePayload payload;
+  protocol::makeQuickMessagePayload(payload, static_cast<uint8_t>(quickIndex),
+                                    config::kQuickMessages[quickIndex]);
+  protocol::PacketBuffer packet;
+  const uint16_t sequence = radio_.reserveSequence();
+  if (!protocol::buildPacket(packet, protocol::PacketType::kQuickMessage,
+                             radio_.localMac(), peer->mac, sequence, 0,
+                             protocol::kFlagAckRequested, &payload,
+                             sizeof(payload)) ||
+      !radio_.queuePacket(peer->mac, packet)) {
     setInlineNotice("SEND FAILED", nowMs);
     return false;
   }
 
   appendConversationEntry(peer->mac, peer->deviceName,
                           config::kQuickMessages[quickIndex], true, true,
-                          static_cast<uint8_t>(quickIndex), nowMs);
+                          static_cast<uint8_t>(quickIndex), nowMs,
+                          DeliveryState::kPending, sequence);
+  const int conversationIndexValue = conversationIndex(peer->mac);
+  const auto* conversation = findConversation(peer->mac);
+  const uint8_t entryIndex =
+      (conversation != nullptr)
+          ? static_cast<uint8_t>((conversation->nextWriteIndex +
+                                  config::kChatHistoryLength - 1) %
+                                 config::kChatHistoryLength)
+          : 0xFF;
+  pendingReliable_.active = true;
+  pendingReliable_.packetType = protocol::PacketType::kQuickMessage;
+  mac::copy(pendingReliable_.targetMac, peer->mac);
+  pendingReliable_.packet = packet;
+  pendingReliable_.sequence = sequence;
+  pendingReliable_.attempts = 1;
+  pendingReliable_.retryAtMs = nowMs + config::kReliableAckTimeoutMs;
+  pendingReliable_.conversationIndex =
+      conversationIndexValue >= 0 ? static_cast<uint8_t>(conversationIndexValue)
+                                  : 0xFF;
+  pendingReliable_.entryIndex = entryIndex;
+  pendingReliable_.quickIndex = static_cast<uint8_t>(quickIndex);
+  pendingReliable_.playQuickClipOnAck = board_.systemSoundsEnabled();
   lastQuickMessageMs_ = nowMs;
   clearInlineNotice();
   Serial.printf("[msg] sent '%s'\n", config::kQuickMessages[quickIndex]);
   board_.beep(1200, 25);
-  if (board_.systemSoundsEnabled()) {
-    if (!audio_.requestQuickMessageClip(static_cast<uint8_t>(quickIndex))) {
-      Serial.printf("[audio] quick voice skipped for Q%u\n",
-                    static_cast<unsigned>(quickIndex + 1));
-    }
-  }
   return true;
 }
 
@@ -370,15 +584,45 @@ bool AppController::sendTextMessage(uint32_t nowMs) {
     setInlineNotice("TEXT UNSUPPORTED", nowMs);
     return false;
   }
+  if (pendingReliable_.active) {
+    setInlineNotice("WAIT", nowMs);
+    return false;
+  }
 
-  const bool sent = radio_.sendTextMessage(peer->mac, composeDraft_);
-  if (!sent) {
+  protocol::TextMessagePayload payload;
+  protocol::makeTextMessagePayload(payload, composeDraft_);
+  protocol::PacketBuffer packet;
+  const uint16_t sequence = radio_.reserveSequence();
+  if (!protocol::buildPacket(packet, protocol::PacketType::kTextMessage,
+                             radio_.localMac(), peer->mac, sequence, 0,
+                             protocol::kFlagAckRequested, &payload,
+                             sizeof(payload)) ||
+      !radio_.queuePacket(peer->mac, packet)) {
     setInlineNotice("SEND FAILED", nowMs);
     return false;
   }
 
   appendConversationEntry(peer->mac, peer->deviceName, composeDraft_, true, false,
-                          0, nowMs);
+                          0, nowMs, DeliveryState::kPending, sequence);
+  const int conversationIndexValue = conversationIndex(peer->mac);
+  const auto* conversation = findConversation(peer->mac);
+  const uint8_t entryIndex =
+      (conversation != nullptr)
+          ? static_cast<uint8_t>((conversation->nextWriteIndex +
+                                  config::kChatHistoryLength - 1) %
+                                 config::kChatHistoryLength)
+          : 0xFF;
+  pendingReliable_.active = true;
+  pendingReliable_.packetType = protocol::PacketType::kTextMessage;
+  mac::copy(pendingReliable_.targetMac, peer->mac);
+  pendingReliable_.packet = packet;
+  pendingReliable_.sequence = sequence;
+  pendingReliable_.attempts = 1;
+  pendingReliable_.retryAtMs = nowMs + config::kReliableAckTimeoutMs;
+  pendingReliable_.conversationIndex =
+      conversationIndexValue >= 0 ? static_cast<uint8_t>(conversationIndexValue)
+                                  : 0xFF;
+  pendingReliable_.entryIndex = entryIndex;
   memset(composeDraft_, 0, sizeof(composeDraft_));
   composeLength_ = 0;
   clearInlineNotice();
@@ -653,8 +897,8 @@ VoiceVisualState AppController::voiceVisualState(uint32_t nowMs) const {
   return VoiceVisualState::kIdle;
 }
 
-UiRenderModel AppController::buildUiModel(uint32_t nowMs) const {
-  UiRenderModel model;
+void AppController::buildUiModel(UiRenderModel& model, uint32_t nowMs) const {
+  model = {};
   model.screenMode = uiMode_;
   model.voiceState = voiceVisualState(nowMs);
   model.batteryPercent = board_.batteryPercent();
@@ -714,6 +958,7 @@ UiRenderModel AppController::buildUiModel(uint32_t nowMs) const {
     line.selected =
         (peers_.selectedMac() != nullptr) &&
         mac::equals(visiblePeer->mac, peers_.selectedMac());
+    line.compatible = visiblePeer->compatible;
     strncpy(line.deviceName, visiblePeer->deviceName,
             sizeof(line.deviceName) - 1);
     line.rssi = visiblePeer->rssi;
@@ -748,11 +993,11 @@ UiRenderModel AppController::buildUiModel(uint32_t nowMs) const {
       line.visible = true;
       line.fromLocal = entry.fromLocal;
       line.quickMessage = entry.quickMessage;
+      line.deliveryState = entry.deliveryState;
       strncpy(line.text, entry.text, sizeof(line.text) - 1);
     }
   }
 
-  return model;
 }
 
 void AppController::update() {
@@ -760,10 +1005,18 @@ void AppController::update() {
   const uint32_t nowMs = millis();
 
   processIncoming(nowMs);
+  processPendingReliable(nowMs);
   peers_.expirePeers(nowMs);
   syncSelectedPeer(nowMs);
   handleInput(nowMs);
   syncSelectedPeer(nowMs);
+  stats_.txPackets = radio_.txPackets();
+  stats_.rxPackets = radio_.rxPackets();
+  stats_.droppedVoicePackets = audio_.droppedPackets();
+  stats_.audioUnderruns = audio_.underruns();
+  stats_.radioSendFailures = radio_.sendFailures();
+  stats_.radioSendTimeouts = radio_.sendTimeouts();
+  stats_.concealedFrames = audio_.concealedFrames();
 
   if (nowMs - lastBeaconMs_ >= config::kBeaconIntervalMs) {
     radio_.sendPresence(board_.batteryPercent());
@@ -771,8 +1024,8 @@ void AppController::update() {
   }
 
   if (nowMs - lastRenderMs_ >= config::kScreenRefreshMs) {
-    const UiRenderModel model = buildUiModel(nowMs);
-    ui_.render(model, nowMs);
+    buildUiModel(renderModel_, nowMs);
+    ui_.render(renderModel_, nowMs);
     lastRenderMs_ = nowMs;
   }
 }

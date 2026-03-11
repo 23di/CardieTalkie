@@ -32,6 +32,13 @@ enum class VoiceVisualState : uint8_t {
   kNoLink,
 };
 
+enum class DeliveryState : uint8_t {
+  kNone = 0,
+  kPending,
+  kDelivered,
+  kFailed,
+};
+
 struct PeerInfo {
   bool occupied = false;
   bool compatible = false;
@@ -48,6 +55,7 @@ struct UiChatLine {
   bool visible = false;
   bool fromLocal = false;
   bool quickMessage = false;
+  DeliveryState deliveryState = DeliveryState::kNone;
   char text[config::kTextMessageLength + 1] = {};
 };
 
@@ -81,6 +89,12 @@ struct RuntimeStats {
   uint32_t droppedVoicePackets = 0;
   uint32_t malformedPackets = 0;
   uint32_t audioUnderruns = 0;
+  uint32_t radioSendFailures = 0;
+  uint32_t radioSendTimeouts = 0;
+  uint32_t reliableRetries = 0;
+  uint32_t reliableAckTimeouts = 0;
+  uint32_t reliableDuplicates = 0;
+  uint32_t concealedFrames = 0;
 };
 
 }  // namespace wt

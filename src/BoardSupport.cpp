@@ -46,6 +46,14 @@ bool BoardSupport::begin(const board::BoardProfile& profile) {
   auto cfg = M5.config();
   cfg.clear_display = true;
   M5Cardputer.begin(cfg, true);
+
+  const auto detectedBoard = M5.getBoard();
+  if (detectedBoard == m5::board_t::board_M5CardputerADV) {
+    profile_ = board::cardputerAdvProfile();
+  } else if (detectedBoard == m5::board_t::board_M5Cardputer) {
+    profile_ = board::cardputerProfile();
+  }
+
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextSize(1);
   M5Cardputer.Display.fillScreen(0x0000);
@@ -59,6 +67,10 @@ bool BoardSupport::begin(const board::BoardProfile& profile) {
   Serial.printf("[board] %s spk_vol=%u spk_mag=%u\n", profile_.variantName,
                 profile_.speakerVolume, profile_.speakerMagnification);
   return true;
+}
+
+const board::BoardProfile& BoardSupport::profile() const {
+  return profile_;
 }
 
 void BoardSupport::setSystemSoundsEnabled(bool enabled) {
@@ -199,12 +211,16 @@ int8_t BoardSupport::batteryPercent() const {
   return static_cast<int8_t>(level);
 }
 
-void BoardSupport::beep(uint16_t frequencyHz, uint16_t durationMs) {
+void BoardSupport::beep(uint16_t frequencyHz, uint16_t durationMs,
+                        uint8_t gainPercent) {
   if (!systemSoundsEnabled_ || effectsVolumeStep_ == 0 ||
       (audioMode_ != AudioMode::kRx && audioMode_ != AudioMode::kIdle)) {
     return;
   }
-  M5Cardputer.Speaker.setVolume(rawVolumeForStep(effectsVolumeStep_));
+  const uint8_t baseVolume = rawVolumeForStep(effectsVolumeStep_);
+  const uint8_t scaledVolume = static_cast<uint8_t>(
+      (static_cast<uint16_t>(baseVolume) * gainPercent) / 100);
+  M5Cardputer.Speaker.setVolume(scaledVolume);
   M5Cardputer.Speaker.tone(frequencyHz, durationMs);
 }
 

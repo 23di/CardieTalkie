@@ -13,6 +13,7 @@ struct UiPeerLine {
   bool valid = false;
   bool highlighted = false;
   bool selected = false;
+  bool compatible = true;
   char deviceName[config::kDeviceNameLength] = {};
   char macText[18] = {};
   int8_t rssi = -127;

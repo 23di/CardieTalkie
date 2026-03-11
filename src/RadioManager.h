@@ -26,10 +26,14 @@ class RadioManager {
   const uint8_t* localMac() const;
 
   bool pollReceived(ReceivedFrame& frame);
+  uint16_t reserveSequence();
+  bool queuePacket(const uint8_t* targetMac, const protocol::PacketBuffer& packet);
   bool sendPresence(int8_t batteryPercent);
   bool sendQuickMessage(const uint8_t* targetMac, uint8_t messageId,
                         const char* text, bool broadcast = false);
   bool sendTextMessage(const uint8_t* targetMac, const char* text);
+  bool sendAck(const uint8_t* targetMac, protocol::PacketType ackedType,
+               uint16_t ackedSequence, uint8_t status = 1);
   bool sendControl(const uint8_t* targetMac, protocol::ControlCode code,
                    uint16_t sessionId);
   bool sendVoiceFrame(const uint8_t* targetMac, uint16_t sessionId,
@@ -39,6 +43,8 @@ class RadioManager {
                       int16_t predictor, uint8_t stepIndex);
   uint32_t txPackets() const;
   uint32_t rxPackets() const;
+  uint32_t sendFailures() const;
+  uint32_t sendTimeouts() const;
 
  private:
   struct TxRequest {
@@ -57,12 +63,11 @@ class RadioManager {
 #endif
   static void onSend(const uint8_t* macAddr, esp_now_send_status_t status);
 
-  bool enqueuePacket(const uint8_t* targetMac, const protocol::PacketBuffer& packet);
   bool ensurePeerRegistered(const uint8_t* targetMac);
   bool installEncryptedPeer(const uint8_t* macAddress);
   void clearEncryptedPeer();
   bool sendRaw(const TxRequest& request);
-  uint16_t nextSequence();
+  bool waitForSendCompletion();
 
   board::BoardProfile profile_{};
   char deviceName_[config::kDeviceNameLength] = {};
@@ -72,7 +77,12 @@ class RadioManager {
   uint16_t nextSequence_ = 1;
   volatile uint32_t txPackets_ = 0;
   volatile uint32_t rxPackets_ = 0;
+  volatile uint32_t sendFailures_ = 0;
+  volatile uint32_t sendTimeouts_ = 0;
   portMUX_TYPE sequenceMux_ = portMUX_INITIALIZER_UNLOCKED;
+  portMUX_TYPE sendMux_ = portMUX_INITIALIZER_UNLOCKED;
+  esp_now_send_status_t pendingSendStatus_ = ESP_NOW_SEND_FAIL;
+  bool pendingSendReady_ = false;
 
   TaskHandle_t txTaskHandle_ = nullptr;
   QueueHandle_t rxQueue_ = nullptr;

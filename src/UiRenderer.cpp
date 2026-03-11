@@ -42,8 +42,6 @@ constexpr int16_t kRightPanelW = 120;
 constexpr int16_t kTextLineH = 10;
 constexpr std::size_t kWrapLineLength = 40;
 constexpr std::size_t kWrapFragmentsPerEntry = 8;
-constexpr std::size_t kMaxWrappedRows =
-    config::kChatHistoryLength * kWrapFragmentsPerEntry;
 constexpr uint8_t kHelpVisibleLines = 8;
 
 M5Canvas canvas(&M5Cardputer.Display);
@@ -200,10 +198,23 @@ void formatChatLine(char* out, std::size_t outSize, const UiChatLine& line,
     sender = line.fromLocal ? "ME" : "PEER";
   }
   if (line.quickMessage) {
-    snprintf(out, outSize, "%s %s", line.fromLocal ? "Q>" : "Q<", line.text);
+    const char* suffix = "";
+    if (line.fromLocal && line.deliveryState == DeliveryState::kPending) {
+      suffix = " ...";
+    } else if (line.fromLocal && line.deliveryState == DeliveryState::kFailed) {
+      suffix = " FAIL";
+    }
+    snprintf(out, outSize, "%s %s%s", line.fromLocal ? "Q>" : "Q<", line.text,
+             suffix);
     return;
   }
-  snprintf(out, outSize, "%s: %s", sender, line.text);
+  const char* suffix = "";
+  if (line.fromLocal && line.deliveryState == DeliveryState::kPending) {
+    suffix = " ...";
+  } else if (line.fromLocal && line.deliveryState == DeliveryState::kFailed) {
+    suffix = " FAIL";
+  }
+  snprintf(out, outSize, "%s: %s%s", sender, line.text, suffix);
 }
 
 std::size_t wrapTextRows(const char* text, std::size_t maxChars,
@@ -252,10 +263,14 @@ std::size_t wrapTextRows(const char* text, std::size_t maxChars,
 std::size_t collectWrappedChatRows(const UiRenderModel& model, std::size_t maxChars,
                                    std::size_t rowBudget,
                                    WrappedChatRow* rowsOut) {
-  WrappedChatRow rows[kMaxWrappedRows];
-  std::size_t totalRows = 0;
+  if (rowBudget == 0 || rowsOut == nullptr) {
+    return 0;
+  }
 
-  for (std::size_t i = 0; i < model.chatLineCount && totalRows < kMaxWrappedRows; ++i) {
+  std::size_t totalRows = 0;
+  std::size_t visibleRows = 0;
+
+  for (std::size_t i = 0; i < model.chatLineCount; ++i) {
     const auto& chatLine = model.chatLines[i];
     if (!chatLine.visible) {
       continue;
@@ -267,24 +282,34 @@ std::size_t collectWrappedChatRows(const UiRenderModel& model, std::size_t maxCh
     char wrapped[kWrapFragmentsPerEntry][kWrapLineLength] = {};
     const std::size_t wrappedCount =
         wrapTextRows(formatted, maxChars, wrapped, kWrapFragmentsPerEntry);
-    const uint16_t fg = chatLine.quickMessage
-                            ? kColorQuick
-                            : (chatLine.fromLocal ? kColorLocal : kColorWhite);
-    for (std::size_t row = 0; row < wrappedCount && totalRows < kMaxWrappedRows; ++row) {
-      strncpy(rows[totalRows].text, wrapped[row], sizeof(rows[totalRows].text) - 1);
-      rows[totalRows].color = fg;
+    uint16_t fg = chatLine.quickMessage
+                      ? kColorQuick
+                      : (chatLine.fromLocal ? kColorLocal : kColorWhite);
+    if (chatLine.fromLocal && chatLine.deliveryState == DeliveryState::kPending) {
+      fg = kColorYellow;
+    } else if (chatLine.fromLocal &&
+               chatLine.deliveryState == DeliveryState::kFailed) {
+      fg = kColorRed;
+    }
+    for (std::size_t row = 0; row < wrappedCount; ++row) {
+      WrappedChatRow nextRow = {};
+      strncpy(nextRow.text, wrapped[row], sizeof(nextRow.text) - 1);
+      nextRow.color = fg;
+
+      if (visibleRows < rowBudget) {
+        rowsOut[visibleRows++] = nextRow;
+      } else {
+        for (std::size_t shift = 1; shift < rowBudget; ++shift) {
+          rowsOut[shift - 1] = rowsOut[shift];
+        }
+        rowsOut[rowBudget - 1] = nextRow;
+      }
       ++totalRows;
     }
   }
 
-  if (totalRows == 0 || rowBudget == 0) {
+  if (totalRows == 0) {
     return 0;
-  }
-
-  const std::size_t visibleRows = min(totalRows, rowBudget);
-  const std::size_t start = totalRows - visibleRows;
-  for (std::size_t i = 0; i < visibleRows; ++i) {
-    rowsOut[i] = rows[start + i];
   }
   return visibleRows;
 }
@@ -377,7 +402,7 @@ void drawHelpScreen(const UiRenderModel& model) {
       y += kTextLineH;
       continue;
     }
-    const bool heading = strcmp(line, "COMMUNICATION") == 0;
+    const bool heading = strcmp(line, "CONTROLS") == 0;
     drawText(12, y, line, heading ? kColorWhite : kColorLightGray, kColorPanelAlt);
     y += 9;
   }
@@ -410,12 +435,19 @@ void drawPeerPicker(const UiRenderModel& model) {
     char label[20];
     snprintf(label, sizeof(label), "%c %.10s", peer.highlighted ? '>' : ' ',
              peer.deviceName);
-    const uint16_t nameColor =
-        peer.selected ? kColorOrange : (peer.highlighted ? kColorCyan : kColorWhite);
+    uint16_t nameColor = peer.selected ? kColorOrange
+                                       : (peer.highlighted ? kColorCyan : kColorWhite);
+    if (!peer.compatible) {
+      nameColor = kColorDarkGray;
+    }
     drawText(12, y, label, nameColor, kColorPanelAlt);
 
-    drawText(104, y, linkQualityText(true, peer.rssi),
-             linkQualityColor(true, peer.rssi), kColorPanelAlt);
+    if (peer.compatible) {
+      drawText(104, y, linkQualityText(true, peer.rssi),
+               linkQualityColor(true, peer.rssi), kColorPanelAlt);
+    } else {
+      drawText(104, y, "UPDATE", kColorYellow, kColorPanelAlt);
+    }
 
     char rssiText[8];
     if (peer.rssi <= -120) {
@@ -423,12 +455,14 @@ void drawPeerPicker(const UiRenderModel& model) {
     } else {
       snprintf(rssiText, sizeof(rssiText), "%d", static_cast<int>(peer.rssi));
     }
-    drawText(152, y, rssiText, kColorLightGray, kColorPanelAlt);
+    drawText(152, y, rssiText, peer.compatible ? kColorLightGray : kColorDarkGray,
+             kColorPanelAlt);
 
     char ageText[8];
     snprintf(ageText, sizeof(ageText), "%lus",
              static_cast<unsigned long>(peer.ageMs / 1000));
-    drawText(192, y, ageText, kColorLightGray, kColorPanelAlt);
+    drawText(192, y, ageText, peer.compatible ? kColorLightGray : kColorDarkGray,
+             kColorPanelAlt);
     y += 12;
   }
   if (model.activePeerCount == 0) {
@@ -458,13 +492,24 @@ void drawFooter(const UiRenderModel& model) {
     return;
   }
 
-  char line[96];
-  snprintf(line, sizeof(line), "FN HELP  %ukHz  VL %u%%  MC %u  FX %s",
-           static_cast<unsigned>(model.qualitySampleRateHz / 1000U),
-           static_cast<unsigned>(model.voiceVolumePercent),
-           static_cast<unsigned>(model.txGainLevel),
+  char line[24];
+  drawText(8, kFooterY + 4, "FN HELP", kColorWhite, kColorBlue);
+
+  snprintf(line, sizeof(line), "%ukHz",
+           static_cast<unsigned>(model.qualitySampleRateHz / 1000U));
+  drawText(58, kFooterY + 4, line, kColorWhite, kColorBlue);
+
+  snprintf(line, sizeof(line), "VOICE %u%%",
+           static_cast<unsigned>(model.voiceVolumePercent));
+  drawText(92, kFooterY + 4, line, kColorWhite, kColorBlue);
+
+  snprintf(line, sizeof(line), "MIC %u%%",
+           static_cast<unsigned>(model.txGainPercent));
+  drawText(154, kFooterY + 4, line, kColorWhite, kColorBlue);
+
+  snprintf(line, sizeof(line), "FX %s",
            model.systemSoundsEnabled ? "ON" : "OFF");
-  drawText(8, kFooterY + 4, line, kColorWhite, kColorBlue);
+  drawText(204, kFooterY + 4, line, kColorWhite, kColorBlue);
 }
 
 }  // namespace

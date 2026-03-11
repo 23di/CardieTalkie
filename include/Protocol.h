@@ -17,6 +17,7 @@ enum class PacketType : uint8_t {
   kQuickMessage = 4,
   kControl = 5,
   kTextMessage = 6,
+  kAck = 7,
 };
 
 enum class ControlCode : uint8_t {
@@ -87,6 +88,12 @@ struct ControlPayload {
   uint8_t reserved0;
   uint16_t reserved1;
 };
+
+struct AckPayload {
+  uint8_t ackedType;
+  uint16_t ackedSequence;
+  uint8_t status;
+};
 #pragma pack(pop)
 
 constexpr std::size_t kHeaderSize = sizeof(PacketHeader);
@@ -115,13 +122,15 @@ inline const char* packetTypeName(PacketType type) {
       return "CONTROL";
     case PacketType::kTextMessage:
       return "TEXT_MESSAGE";
+    case PacketType::kAck:
+      return "ACK";
   }
   return "UNKNOWN";
 }
 
 inline bool isKnownType(uint8_t rawType) {
   return rawType >= static_cast<uint8_t>(PacketType::kPresence) &&
-         rawType <= static_cast<uint8_t>(PacketType::kTextMessage);
+         rawType <= static_cast<uint8_t>(PacketType::kAck);
 }
 
 inline bool isTargetForLocal(const PacketHeader& header,
@@ -155,14 +164,15 @@ inline bool buildPacket(PacketBuffer& out, PacketType type, const uint8_t* sende
   return true;
 }
 
-inline bool isValidPacketBuffer(const uint8_t* data, std::size_t length) {
+inline bool isValidPacketBufferForVersion(const uint8_t* data, std::size_t length,
+                                          uint8_t protocolVersion) {
   if (length < kHeaderSize || length > kMaxPacketBytes) {
     return false;
   }
 
   const auto* header = reinterpret_cast<const PacketHeader*>(data);
   if (header->magic != config::kProtocolMagic ||
-      header->version != config::kProtocolVersion ||
+      header->version != protocolVersion ||
       !isKnownType(header->type)) {
     return false;
   }
@@ -217,9 +227,23 @@ inline bool isValidPacketBuffer(const uint8_t* data, std::size_t length) {
             data + kHeaderSize);
         return text->textLength <= config::kTextMessageLength;
       }
+    case PacketType::kAck:
+      return header->payloadLength == sizeof(AckPayload);
   }
 
   return false;
+}
+
+inline bool isValidPacketBuffer(const uint8_t* data, std::size_t length) {
+  return isValidPacketBufferForVersion(data, length, config::kProtocolVersion);
+}
+
+inline bool isLegacyPresencePacket(const uint8_t* data, std::size_t length) {
+  if (!isValidPacketBufferForVersion(data, length, config::kLegacyProtocolVersion)) {
+    return false;
+  }
+  const auto* packetHeader = reinterpret_cast<const PacketHeader*>(data);
+  return packetHeader->type == static_cast<uint8_t>(PacketType::kPresence);
 }
 
 inline const PacketHeader* header(const uint8_t* data) {
@@ -257,6 +281,10 @@ inline const ControlPayload* controlPayload(const uint8_t* data) {
   return reinterpret_cast<const ControlPayload*>(data + kHeaderSize);
 }
 
+inline const AckPayload* ackPayload(const uint8_t* data) {
+  return reinterpret_cast<const AckPayload*>(data + kHeaderSize);
+}
+
 inline void makePresencePayload(PresencePayload& payload, const char* deviceName,
                                 board::BoardVariant boardVariant,
                                 uint8_t capabilityFlags,
@@ -289,6 +317,14 @@ inline void makeTextMessagePayload(TextMessagePayload& payload,
 inline void makeControlPayload(ControlPayload& payload, ControlCode code) {
   memset(&payload, 0, sizeof(payload));
   payload.controlCode = static_cast<uint8_t>(code);
+}
+
+inline void makeAckPayload(AckPayload& payload, PacketType ackedType,
+                           uint16_t ackedSequence, uint8_t status) {
+  memset(&payload, 0, sizeof(payload));
+  payload.ackedType = static_cast<uint8_t>(ackedType);
+  payload.ackedSequence = ackedSequence;
+  payload.status = status;
 }
 
 inline std::size_t makeVoicePayload(uint8_t* outPayload, AudioCodec codec,

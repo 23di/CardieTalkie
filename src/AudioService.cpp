@@ -21,17 +21,15 @@ struct MelodyDefinition {
 };
 
 constexpr MelodyNote kMelodyNyan[] = {
-    {622, 100}, {659, 100}, {740, 100}, {494, 100}, {659, 100}, {622, 100},
-    {659, 100}, {740, 100}, {494, 100}, {466, 100}, {740, 100}, {1109, 100},
-    {1047, 100}, {1109, 100}, {1245, 100}, {1047, 100}, {622, 100}, {659, 100},
-    {740, 100}, {494, 100}, {466, 100}, {698, 100}, {784, 100}, {587, 100},
-    {622, 100}, {554, 100}, {523, 100}, {587, 100}, {587, 100}, {523, 100},
-    {587, 100}, {698, 100}, {784, 100}, {587, 100}, {698, 100}, {523, 100},
-    {587, 100}, {698, 100}, {784, 100}, {587, 100}, {698, 100}, {523, 100},
-    {587, 100}, {523, 100}, {587, 100}, {698, 100}, {523, 100}, {587, 100},
-    {523, 100}, {523, 100}, {698, 100}, {784, 100}, {587, 100}, {622, 100},
-    {523, 100}, {587, 100}, {523, 100}, {523, 100}, {587, 100}, {587, 100},
-    {523, 100},
+    {349, 250}, {392, 250}, {277, 125}, {294, 125}, {262, 125}, {311, 125},
+    {262, 125}, {233, 250}, {233, 250}, {262, 250}, {311, 250}, {311, 125},
+    {262, 125}, {233, 125}, {262, 125}, {294, 125}, {349, 125}, {392, 125},
+    {294, 125}, {349, 125}, {262, 125}, {294, 125}, {233, 125}, {262, 125},
+    {233, 125}, {294, 250}, {349, 250}, {392, 125}, {294, 125}, {349, 125},
+    {262, 125}, {294, 125}, {233, 125}, {277, 125}, {294, 125}, {311, 125},
+    {262, 125}, {233, 125}, {262, 125}, {311, 250}, {233, 125}, {262, 125},
+    {294, 125}, {349, 125}, {262, 125}, {311, 125}, {262, 125}, {233, 125},
+    {262, 250}, {233, 250}, {262, 250},
 };
 
 constexpr MelodyNote kMelodyRickroll[] = {
@@ -114,6 +112,41 @@ void synthesizeMelodyFrame(uint8_t* output, std::size_t frameBytes,
     }
     --samplesRemainingInNote;
   }
+}
+
+void synthesizeToneFrame(uint8_t* output, std::size_t frameBytes,
+                         uint32_t sampleRateHz, uint16_t frequencyHz,
+                         uint32_t& phaseAccumulator) {
+  const uint8_t kLowSample = 88;
+  const uint8_t kHighSample = 168;
+
+  if (output == nullptr || frameBytes == 0) {
+    return;
+  }
+
+  if (frequencyHz == 0 || sampleRateHz == 0) {
+    memset(output, 128, frameBytes);
+    phaseAccumulator = 0;
+    return;
+  }
+
+  const uint32_t phaseStep = static_cast<uint32_t>(
+      (static_cast<uint64_t>(frequencyHz) << 32) / sampleRateHz);
+  for (std::size_t i = 0; i < frameBytes; ++i) {
+    phaseAccumulator += phaseStep;
+    output[i] = (phaseAccumulator & 0x80000000UL) != 0 ? kHighSample
+                                                       : kLowSample;
+  }
+}
+
+uint8_t frameCountForDuration(uint16_t durationMs, uint8_t frameDurationMs) {
+  if (frameDurationMs == 0) {
+    return 1;
+  }
+  const uint16_t frames =
+      (durationMs + static_cast<uint16_t>(frameDurationMs - 1)) /
+      frameDurationMs;
+  return static_cast<uint8_t>(frames == 0 ? 1 : frames);
 }
 
 }  // namespace
@@ -258,6 +291,7 @@ void AudioService::clearVoiceSlotsLocked() {
   memset(rxSlots_, 0, sizeof(rxSlots_));
   rxSessionId_ = 0;
   expectedSequence_ = 0;
+  resetConcealmentState();
 }
 
 void AudioService::clearReceiveState() {
@@ -269,6 +303,26 @@ void AudioService::clearReceiveState() {
   remotePttActive_ = false;
   rxActiveUntilMs_ = 0;
   portEXIT_CRITICAL(&stateMux_);
+}
+
+void AudioService::resetConcealmentState() {
+  concealmentRun_ = 0;
+  lastPlaybackFrameValid_ = false;
+  memset(&lastPlaybackFrame_, 0, sizeof(lastPlaybackFrame_));
+}
+
+void AudioService::rememberPlaybackFrame(const PlaybackFrame& frame) {
+  lastPlaybackFrame_ = frame;
+  lastPlaybackFrameValid_ = true;
+  concealmentRun_ = 0;
+}
+
+bool AudioService::captureMicFrame(uint8_t* frame,
+                                   const config::AudioQualityProfile& profile) {
+  if (board_ == nullptr) {
+    return false;
+  }
+  return board_->captureAudioFrame(frame, profile.frameBytes, profile.sampleRateHz);
 }
 
 void AudioService::insertVoiceFrame(uint16_t sessionId, uint16_t sequence,
@@ -417,6 +471,11 @@ void AudioService::removeSlot(int slotIndex) {
 
 void AudioService::applyTxGain(uint8_t* frame, std::size_t frameBytes,
                                uint8_t gainPercent) {
+  applyPcmU8Gain(frame, frameBytes, gainPercent);
+}
+
+void AudioService::applyPcmU8Gain(uint8_t* frame, std::size_t frameBytes,
+                                  uint8_t gainPercent) {
   if (frame == nullptr || gainPercent == 100) {
     return;
   }
@@ -431,6 +490,31 @@ void AudioService::applyTxGain(uint8_t* frame, std::size_t frameBytes,
     }
     frame[i] = static_cast<uint8_t>(scaled + 128);
   }
+}
+
+bool AudioService::makeConcealedPlaybackFrame(PlaybackFrame& output,
+                                              uint16_t sampleRateHz,
+                                              uint8_t frameDurationMs,
+                                              uint8_t frameBytes) {
+  output.sampleRateHz = sampleRateHz;
+  output.frameDurationMs = frameDurationMs;
+  output.frameBytes = frameBytes;
+  if (!lastPlaybackFrameValid_ || lastPlaybackFrame_.frameBytes != frameBytes) {
+    codec_->makeSilence(output.data, output.frameBytes);
+    return false;
+  }
+
+  memcpy(output.data, lastPlaybackFrame_.data, frameBytes);
+  if (concealmentRun_ < config::kMaxConcealmentFrames) {
+    applyPcmU8Gain(output.data, output.frameBytes,
+                   config::kConcealmentDecayPercents[concealmentRun_]);
+    ++concealmentRun_;
+    ++concealedFrames_;
+    return true;
+  }
+
+  codec_->makeSilence(output.data, output.frameBytes);
+  return false;
 }
 
 bool AudioService::popNextPlaybackFrame(PlaybackFrame& output, uint32_t nowMs) {
@@ -471,9 +555,15 @@ bool AudioService::popNextPlaybackFrame(PlaybackFrame& output, uint32_t nowMs) {
     }
 
     const bool bufferedEnough = validCount >= config::kJitterStartFrames;
+    const uint8_t waitFrameDurationMs =
+        rxSlots_[bestIndex].frameDurationMs
+            ? rxSlots_[bestIndex].frameDurationMs
+            : config::kAudioFrameDurationMs;
     const bool waitedLongEnough =
         earliestArrival != UINT32_MAX &&
-        (nowMs - earliestArrival) >= config::kAudioFrameDurationMs;
+        (nowMs - earliestArrival) >=
+            (static_cast<uint32_t>(waitFrameDurationMs) *
+             config::kJitterGapWaitFrames);
 
     if (bestSequence == expectedSequence_) {
       output.sampleRateHz = rxSlots_[bestIndex].sampleRateHz;
@@ -493,6 +583,8 @@ bool AudioService::popNextPlaybackFrame(PlaybackFrame& output, uint32_t nowMs) {
       }
       if (!decoded) {
         codec_->makeSilence(output.data, output.frameBytes);
+      } else {
+        rememberPlaybackFrame(output);
       }
       removeSlot(bestIndex);
       ++expectedSequence_;
@@ -513,7 +605,8 @@ bool AudioService::popNextPlaybackFrame(PlaybackFrame& output, uint32_t nowMs) {
           rxSlots_[bestIndex].pcmFrameBytes
               ? rxSlots_[bestIndex].pcmFrameBytes
               : qualityProfile().frameBytes;
-      codec_->makeSilence(output.data, output.frameBytes);
+      makeConcealedPlaybackFrame(output, output.sampleRateHz,
+                                 output.frameDurationMs, output.frameBytes);
       ++expectedSequence_;
       ++droppedPackets_;
       portEXIT_CRITICAL(&rxMux_);
@@ -566,6 +659,10 @@ uint32_t AudioService::underruns() const {
   return audioUnderruns_;
 }
 
+uint32_t AudioService::concealedFrames() const {
+  return concealedFrames_;
+}
+
 void AudioService::txTaskEntry(void* context) {
   auto* self = static_cast<AudioService*>(context);
   uint8_t frame[config::kMaxAudioFrameBytes] = {};
@@ -588,32 +685,101 @@ void AudioService::txTaskEntry(void* context) {
   TxMode activeMode = TxMode::kIdle;
   bool wasActive = false;
 
-  auto startSession = [&](const uint8_t* target) {
-    self->board_->beep(config::kPttStartToneHz, config::kPttStartToneMs);
+  auto sendEncodedFrame =
+      [&](const uint8_t* pcmFrame, const config::AudioQualityProfile& profile) {
+        int16_t predictor = 0;
+        uint8_t stepIndex = 0;
+        const std::size_t encodedBytes =
+            self->codec_->encode(pcmFrame, profile.frameBytes, encoded,
+                                 sizeof(encoded), predictor, stepIndex);
+        if (encodedBytes == 0) {
+          return false;
+        }
+        return self->radio_->sendVoiceFrame(
+            activeTarget, activeSessionId, self->codec_->codecType(), encoded,
+            encodedBytes, profile.sampleRateHz, profile.frameDurationMs,
+            profile.frameBytes, predictor, stepIndex);
+      };
+
+  auto transmitRemotePttCue =
+      [&](bool isStartCue, const config::AudioQualityProfile& profile) {
+        if (!self->board_->systemSoundsEnabled() ||
+            self->board_->effectsVolumeStep() == 0) {
+          return;
+        }
+
+        auto sendSegment = [&](uint16_t frequencyHz, uint16_t durationMs) {
+          uint32_t phaseAccumulator = 0;
+          const uint8_t frameCount =
+              frameCountForDuration(durationMs, profile.frameDurationMs);
+          for (uint8_t frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
+            synthesizeToneFrame(frame, profile.frameBytes, profile.sampleRateHz,
+                                frequencyHz, phaseAccumulator);
+            applyPcmU8Gain(frame, profile.frameBytes,
+                           config::kRemotePttCueGainPercent);
+            sendEncodedFrame(frame, profile);
+            vTaskDelay(pdMS_TO_TICKS(profile.frameDurationMs));
+          }
+        };
+
+        if (isStartCue) {
+          sendSegment(config::kPttStartToneHz, config::kPttStartToneMs);
+          return;
+        }
+
+        sendSegment(config::kPttStopToneHz, config::kPttStopToneMs);
+        sendSegment(0, config::kPttToneGapMs);
+        sendSegment(config::kPttStopToneTailHz, config::kPttStopToneTailMs);
+      };
+
+  auto startSession = [&](const uint8_t* target,
+                          const config::AudioQualityProfile& qualityProfile,
+                          bool transmitAirCue) {
+    self->clearReceiveState();
+    self->board_->stopPlayback();
+    self->board_->beep(config::kPttStartToneHz, config::kPttStartToneMs,
+                       config::kLocalPttCueGainPercent);
+
     activeSessionId = static_cast<uint16_t>(millis() & 0xFFFF);
     if (activeSessionId == 0) {
       activeSessionId = 1;
     }
     mac::copy(activeTarget, target);
-    self->clearReceiveState();
-    self->board_->stopPlayback();
     self->radio_->sendControl(activeTarget, protocol::ControlCode::kPttStart,
                               activeSessionId);
     portENTER_CRITICAL(&self->stateMux_);
     self->txActive_ = true;
     self->txSessionId_ = activeSessionId;
     portEXIT_CRITICAL(&self->stateMux_);
+    if (transmitAirCue) {
+      transmitRemotePttCue(true, qualityProfile);
+    }
     wasActive = true;
   };
 
-  auto finishSession = [&]() {
+  auto finishSession = [&](const config::AudioQualityProfile& qualityProfile,
+                           bool transmitAirCue) {
+    const bool playPttCue =
+        self->board_->systemSoundsEnabled() &&
+        self->board_->effectsVolumeStep() > 0;
+    if (transmitAirCue) {
+      transmitRemotePttCue(false, qualityProfile);
+    }
     self->radio_->sendControl(activeTarget, protocol::ControlCode::kPttStop,
                               activeSessionId);
     portENTER_CRITICAL(&self->stateMux_);
     self->txActive_ = false;
     portEXIT_CRITICAL(&self->stateMux_);
     self->board_->enterRxMode();
-    self->board_->beep(config::kPttStopToneHz, config::kPttStopToneMs);
+    self->board_->beep(config::kPttStopToneHz, config::kPttStopToneMs,
+                       config::kLocalPttCueGainPercent);
+    if (playPttCue) {
+      vTaskDelay(pdMS_TO_TICKS(config::kPttStopToneMs + config::kPttToneGapMs));
+      self->board_->beep(config::kPttStopToneTailHz,
+                         config::kPttStopToneTailMs,
+                         config::kLocalPttCueGainPercent);
+      vTaskDelay(pdMS_TO_TICKS(config::kPttStopToneTailMs));
+    }
     wasActive = false;
     activeMode = TxMode::kIdle;
     activeQuickClip = nullptr;
@@ -645,8 +811,10 @@ void AudioService::txTaskEntry(void* context) {
     }
     portEXIT_CRITICAL(&self->stateMux_);
 
+    const auto& qualityProfile = config::kAudioQualityProfiles[qualityIndex];
+
     if (activeMode == TxMode::kIdle && pttHeld && hasPeer) {
-      startSession(target);
+      startSession(target, qualityProfile, true);
       activeMode = TxMode::kMic;
     }
 
@@ -656,7 +824,7 @@ void AudioService::txTaskEntry(void* context) {
       self->quickClipRequested_ = false;
       portEXIT_CRITICAL(&self->stateMux_);
       if (clip != nullptr && clip->data != nullptr && clip->length > 0) {
-        startSession(target);
+        startSession(target, qualityProfile, false);
         activeQuickClip = clip;
         activeQuickClipOffset = 0;
         activeMode = TxMode::kQuickClip;
@@ -666,7 +834,7 @@ void AudioService::txTaskEntry(void* context) {
     }
 
     if (activeMode == TxMode::kIdle && !pttHeld && hasPeer && melodyRequested) {
-      startSession(target);
+      startSession(target, qualityProfile, false);
       portENTER_CRITICAL(&self->stateMux_);
       self->melodyRequested_ = false;
       portEXIT_CRITICAL(&self->stateMux_);
@@ -686,7 +854,7 @@ void AudioService::txTaskEntry(void* context) {
 
     if (activeMode == TxMode::kMic && !(pttHeld && hasPeer)) {
       if (wasActive) {
-        finishSession();
+        finishSession(qualityProfile, true);
       }
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -697,27 +865,25 @@ void AudioService::txTaskEntry(void* context) {
     uint8_t frameDurationMs = 0;
 
     if (activeMode == TxMode::kMic) {
-      const auto& profile = config::kAudioQualityProfiles[qualityIndex];
-      if (!self->board_->captureAudioFrame(frame, profile.frameBytes,
-                                           profile.sampleRateHz)) {
+      if (!self->captureMicFrame(frame, qualityProfile)) {
         vTaskDelay(pdMS_TO_TICKS(2));
         continue;
       }
-      frameBytes = profile.frameBytes;
-      sampleRateHz = profile.sampleRateHz;
-      frameDurationMs = profile.frameDurationMs;
+      frameBytes = qualityProfile.frameBytes;
+      sampleRateHz = qualityProfile.sampleRateHz;
+      frameDurationMs = qualityProfile.frameDurationMs;
     } else if (activeMode == TxMode::kMelody) {
-      const auto& profile = config::kAudioQualityProfiles[qualityIndex];
-      synthesizeMelodyFrame(frame, profile.frameBytes, profile.sampleRateHz,
+      synthesizeMelodyFrame(frame, qualityProfile.frameBytes,
+                            qualityProfile.sampleRateHz,
                             kMelodies[activeMelodyIndex], melodyNoteIndex,
                             melodySamplesRemaining, melodyFrequencyHz,
                             melodyPhaseAccumulator);
-      frameBytes = profile.frameBytes;
-      sampleRateHz = profile.sampleRateHz;
-      frameDurationMs = profile.frameDurationMs;
+      frameBytes = qualityProfile.frameBytes;
+      sampleRateHz = qualityProfile.sampleRateHz;
+      frameDurationMs = qualityProfile.frameDurationMs;
     } else {
       if (activeQuickClip == nullptr || activeQuickClipOffset >= activeQuickClip->length) {
-        finishSession();
+        finishSession(qualityProfile, false);
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -735,6 +901,9 @@ void AudioService::txTaskEntry(void* context) {
     }
 
     applyTxGain(frame, frameBytes, config::kTxGainPercents[txGainIndex]);
+    if (activeMode == TxMode::kMelody) {
+      applyPcmU8Gain(frame, frameBytes, config::kMelodyTxGainPercent);
+    }
     int16_t predictor = 0;
     uint8_t stepIndex = 0;
     const std::size_t encodedBytes =
@@ -752,7 +921,7 @@ void AudioService::txTaskEntry(void* context) {
     if (activeMode == TxMode::kMelody) {
       if (melodyNoteIndex >= kMelodies[activeMelodyIndex].noteCount &&
           melodySamplesRemaining == 0) {
-        finishSession();
+        finishSession(qualityProfile, false);
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -762,7 +931,7 @@ void AudioService::txTaskEntry(void* context) {
 
     if (activeMode == TxMode::kQuickClip) {
       if (activeQuickClip == nullptr || activeQuickClipOffset >= activeQuickClip->length) {
-        finishSession();
+        finishSession(qualityProfile, false);
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }

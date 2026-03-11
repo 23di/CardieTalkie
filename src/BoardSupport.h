@@ -14,13 +14,15 @@ class BoardSupport {
   void update();
   InputSnapshot readInput();
   int8_t batteryPercent() const;
-  void beep(uint16_t frequencyHz, uint16_t durationMs);
+  void beep(uint16_t frequencyHz, uint16_t durationMs,
+            uint8_t gainPercent = 100);
   void setSystemSoundsEnabled(bool enabled);
   bool systemSoundsEnabled() const;
   void setEffectsVolumeStep(uint8_t step);
   uint8_t effectsVolumeStep() const;
   void setVoiceVolumeStep(uint8_t step);
   uint8_t voiceVolumeStep() const;
+  const board::BoardProfile& profile() const;
 
   bool enterTxMode();
   bool enterRxMode();

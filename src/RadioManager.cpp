@@ -104,15 +104,15 @@ bool RadioManager::pollReceived(ReceivedFrame& frame) {
   return true;
 }
 
-uint16_t RadioManager::nextSequence() {
+uint16_t RadioManager::reserveSequence() {
   portENTER_CRITICAL(&sequenceMux_);
   const uint16_t value = nextSequence_++;
   portEXIT_CRITICAL(&sequenceMux_);
   return value;
 }
 
-bool RadioManager::enqueuePacket(const uint8_t* targetMac,
-                                 const protocol::PacketBuffer& packet) {
+bool RadioManager::queuePacket(const uint8_t* targetMac,
+                               const protocol::PacketBuffer& packet) {
   TxRequest request;
   mac::copy(request.targetMac, targetMac);
   request.length = packet.length;
@@ -138,12 +138,12 @@ bool RadioManager::sendPresence(int8_t batteryPercent) {
 
   protocol::PacketBuffer packet;
   if (!protocol::buildPacket(packet, protocol::PacketType::kPresence, localMac_,
-                             broadcastMac, nextSequence(), 0,
+                             broadcastMac, reserveSequence(), 0,
                              protocol::kFlagBroadcast, &payload,
                              sizeof(payload))) {
     return false;
   }
-  return enqueuePacket(broadcastMac, packet);
+  return queuePacket(broadcastMac, packet);
 }
 
 bool RadioManager::sendQuickMessage(const uint8_t* targetMac, uint8_t messageId,
@@ -160,12 +160,12 @@ bool RadioManager::sendQuickMessage(const uint8_t* targetMac, uint8_t messageId,
 
   protocol::PacketBuffer packet;
   if (!protocol::buildPacket(packet, protocol::PacketType::kQuickMessage,
-                             localMac_, resolvedTarget, nextSequence(), 0,
+                             localMac_, resolvedTarget, reserveSequence(), 0,
                              broadcast ? protocol::kFlagBroadcast : 0, &payload,
                              sizeof(payload))) {
     return false;
   }
-  return enqueuePacket(resolvedTarget, packet);
+  return queuePacket(resolvedTarget, packet);
 }
 
 bool RadioManager::sendTextMessage(const uint8_t* targetMac, const char* text) {
@@ -178,11 +178,30 @@ bool RadioManager::sendTextMessage(const uint8_t* targetMac, const char* text) {
 
   protocol::PacketBuffer packet;
   if (!protocol::buildPacket(packet, protocol::PacketType::kTextMessage,
-                             localMac_, targetMac, nextSequence(), 0, 0,
+                             localMac_, targetMac, reserveSequence(), 0, 0,
                              &payload, sizeof(payload))) {
     return false;
   }
-  return enqueuePacket(targetMac, packet);
+  return queuePacket(targetMac, packet);
+}
+
+bool RadioManager::sendAck(const uint8_t* targetMac,
+                           protocol::PacketType ackedType,
+                           uint16_t ackedSequence, uint8_t status) {
+  if (targetMac == nullptr) {
+    return false;
+  }
+
+  protocol::AckPayload payload;
+  protocol::makeAckPayload(payload, ackedType, ackedSequence, status);
+
+  protocol::PacketBuffer packet;
+  if (!protocol::buildPacket(packet, protocol::PacketType::kAck, localMac_,
+                             targetMac, reserveSequence(), 0, 0, &payload,
+                             sizeof(payload))) {
+    return false;
+  }
+  return queuePacket(targetMac, packet);
 }
 
 bool RadioManager::sendControl(const uint8_t* targetMac,
@@ -193,11 +212,11 @@ bool RadioManager::sendControl(const uint8_t* targetMac,
 
   protocol::PacketBuffer packet;
   if (!protocol::buildPacket(packet, protocol::PacketType::kControl, localMac_,
-                             targetMac, nextSequence(), sessionId, 0, &payload,
+                             targetMac, reserveSequence(), sessionId, 0, &payload,
                              sizeof(payload))) {
     return false;
   }
-  return enqueuePacket(targetMac, packet);
+  return queuePacket(targetMac, packet);
 }
 
 bool RadioManager::sendVoiceFrame(const uint8_t* targetMac, uint16_t sessionId,
@@ -222,11 +241,11 @@ bool RadioManager::sendVoiceFrame(const uint8_t* targetMac, uint16_t sessionId,
 
   protocol::PacketBuffer packet;
   if (!protocol::buildPacket(packet, protocol::PacketType::kVoice, localMac_,
-                             targetMac, nextSequence(), sessionId, 0,
+                             targetMac, reserveSequence(), sessionId, 0,
                              voicePayload, voicePayloadLength)) {
     return false;
   }
-  return enqueuePacket(targetMac, packet);
+  return queuePacket(targetMac, packet);
 }
 
 bool RadioManager::ensurePeerRegistered(const uint8_t* targetMac) {
@@ -304,13 +323,40 @@ bool RadioManager::sendRaw(const TxRequest& request) {
   return true;
 }
 
+bool RadioManager::waitForSendCompletion() {
+  if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(config::kEspNowSendTimeoutMs)) == 0) {
+    ++sendTimeouts_;
+    return false;
+  }
+
+  esp_now_send_status_t status = ESP_NOW_SEND_FAIL;
+  bool ready = false;
+  portENTER_CRITICAL(&sendMux_);
+  status = pendingSendStatus_;
+  ready = pendingSendReady_;
+  pendingSendReady_ = false;
+  portEXIT_CRITICAL(&sendMux_);
+  if (!ready || status != ESP_NOW_SEND_SUCCESS) {
+    ++sendFailures_;
+    return false;
+  }
+  return true;
+}
+
 void RadioManager::txTaskEntry(void* context) {
   auto* self = static_cast<RadioManager*>(context);
   TxRequest request;
   for (;;) {
     if (xQueueReceive(self->txQueue_, &request, portMAX_DELAY) == pdTRUE) {
-      self->sendRaw(request);
-      vTaskDelay(pdMS_TO_TICKS(1));
+      ulTaskNotifyTake(pdTRUE, 0);
+      portENTER_CRITICAL(&self->sendMux_);
+      self->pendingSendReady_ = false;
+      portEXIT_CRITICAL(&self->sendMux_);
+      if (!self->sendRaw(request)) {
+        ++self->sendFailures_;
+        continue;
+      }
+      self->waitForSendCompletion();
     }
   }
 }
@@ -352,12 +398,16 @@ void RadioManager::onReceive(const uint8_t* sourceMac, const uint8_t* data,
 #endif
 
 void RadioManager::onSend(const uint8_t* macAddr, esp_now_send_status_t status) {
-  if (status == ESP_NOW_SEND_SUCCESS || macAddr == nullptr) {
+  if (instance_ == nullptr || macAddr == nullptr) {
     return;
   }
-  char macBuffer[18];
-  Serial.printf("[radio] send status %d for %s\n", static_cast<int>(status),
-                mac::toString(macAddr, macBuffer, sizeof(macBuffer)));
+  portENTER_CRITICAL(&instance_->sendMux_);
+  instance_->pendingSendStatus_ = status;
+  instance_->pendingSendReady_ = true;
+  portEXIT_CRITICAL(&instance_->sendMux_);
+  if (instance_->txTaskHandle_ != nullptr) {
+    xTaskNotifyGive(instance_->txTaskHandle_);
+  }
 }
 
 uint32_t RadioManager::txPackets() const {
@@ -366,6 +416,14 @@ uint32_t RadioManager::txPackets() const {
 
 uint32_t RadioManager::rxPackets() const {
   return rxPackets_;
+}
+
+uint32_t RadioManager::sendFailures() const {
+  return sendFailures_;
+}
+
+uint32_t RadioManager::sendTimeouts() const {
+  return sendTimeouts_;
 }
 
 }  // namespace wt

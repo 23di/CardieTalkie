@@ -41,6 +41,7 @@ class AudioService {
   bool isReceiving(uint32_t nowMs) const;
   uint32_t droppedPackets() const;
   uint32_t underruns() const;
+  uint32_t concealedFrames() const;
 
  private:
   struct VoiceSlot {
@@ -69,15 +70,23 @@ class AudioService {
   static void rxTaskEntry(void* context);
 
   bool popNextPlaybackFrame(PlaybackFrame& output, uint32_t nowMs);
+  bool captureMicFrame(uint8_t* frame,
+                       const config::AudioQualityProfile& profile);
   void insertVoiceFrame(uint16_t sessionId, uint16_t sequence,
                         protocol::AudioCodec codec, uint16_t sampleRateHz,
                         uint8_t frameDurationMs, uint8_t encodedFrameBytes,
                         uint8_t pcmFrameBytes, int16_t predictor,
                         uint8_t stepIndex, const uint8_t* data, uint32_t nowMs);
   void clearVoiceSlotsLocked();
+  void resetConcealmentState();
+  void rememberPlaybackFrame(const PlaybackFrame& frame);
+  bool makeConcealedPlaybackFrame(PlaybackFrame& output, uint16_t sampleRateHz,
+                                  uint8_t frameDurationMs, uint8_t frameBytes);
   void removeSlot(int slotIndex);
   static void applyTxGain(uint8_t* frame, std::size_t frameBytes,
                           uint8_t gainPercent);
+  static void applyPcmU8Gain(uint8_t* frame, std::size_t frameBytes,
+                             uint8_t gainPercent);
 
   BoardSupport* board_ = nullptr;
   RadioManager* radio_ = nullptr;
@@ -107,6 +116,10 @@ class AudioService {
   uint32_t rxActiveUntilMs_ = 0;
   uint32_t droppedPackets_ = 0;
   uint32_t audioUnderruns_ = 0;
+  uint32_t concealedFrames_ = 0;
+  uint8_t concealmentRun_ = 0;
+  bool lastPlaybackFrameValid_ = false;
+  PlaybackFrame lastPlaybackFrame_{};
   VoiceSlot rxSlots_[config::kJitterBufferFrames] = {};
 };
 

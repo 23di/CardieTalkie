@@ -7,7 +7,8 @@
 
 namespace wt::config {
 
-constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kLegacyProtocolVersion = 1;
+constexpr uint8_t kProtocolVersion = 2;
 constexpr uint8_t kProtocolMagic = 0x57;
 constexpr uint8_t kEspNowChannel = 1;
 constexpr std::size_t kEspNowKeyLength = 16;
@@ -66,14 +67,26 @@ constexpr std::array<AudioQualityProfile, 3> kAudioQualityProfiles = {{
      static_cast<uint8_t>((12000 * 10) / 1000)},
 }};
 
-constexpr std::size_t kJitterBufferFrames = 6;
-constexpr std::size_t kJitterStartFrames = 2;
+constexpr std::size_t kJitterBufferFrames = 8;
+constexpr std::size_t kJitterStartFrames = 3;
+constexpr std::size_t kJitterGapWaitFrames = 2;
+constexpr std::size_t kMaxConcealmentFrames = 3;
+constexpr std::array<uint8_t, kMaxConcealmentFrames> kConcealmentDecayPercents = {{
+    100,
+    70,
+    45,
+}};
 constexpr std::size_t kRxQueueDepth = 24;
 constexpr std::size_t kTxQueueDepth = 24;
 constexpr std::size_t kPacketPayloadMax = 176;
 constexpr uint16_t kTxAudioTaskStack = 4096;
 constexpr uint16_t kRxAudioTaskStack = 4096;
 constexpr uint16_t kRadioTxTaskStack = 4096;
+constexpr uint32_t kEspNowSendTimeoutMs = 20;
+constexpr uint8_t kReliableMessageMaxAttempts = 3;
+constexpr uint32_t kReliableAckTimeoutMs = 150;
+constexpr uint32_t kReliableMessageDedupMs = 5000;
+constexpr std::size_t kReliableMessageDedupEntries = 8;
 
 constexpr uint8_t kMaxVolumeStep = 5;
 constexpr uint8_t kDefaultEffectsVolumeStep = 1;
@@ -84,9 +97,15 @@ constexpr uint8_t kSpeakerVolume = 180;
 constexpr bool kEnableQuickMessageBeep = true;
 constexpr bool kBroadcastQuickMessagesEnabled = false;
 constexpr uint16_t kPttStartToneHz = 1600;
-constexpr uint16_t kPttStartToneMs = 24;
-constexpr uint16_t kPttStopToneHz = 900;
+constexpr uint16_t kPttStartToneMs = 28;
+constexpr uint16_t kPttStopToneHz = 1100;
 constexpr uint16_t kPttStopToneMs = 28;
+constexpr uint16_t kPttStopToneTailHz = 700;
+constexpr uint16_t kPttStopToneTailMs = 36;
+constexpr uint16_t kPttToneGapMs = 14;
+constexpr uint8_t kLocalPttCueGainPercent = 25;
+constexpr uint8_t kRemotePttCueGainPercent = 25;
+constexpr uint8_t kMelodyTxGainPercent = 25;
 
 constexpr uint8_t kDefaultTxGainIndex = 2;
 constexpr std::array<uint8_t, 5> kTxGainPercents = {{
@@ -118,7 +137,7 @@ constexpr std::array<const char*, kMaxQuickMessages> kQuickMessages = {
 };
 
 constexpr std::array<const char*, 21> kHelpLines = {{
-    "COMMUNICATION",
+    "CONTROLS",
     "SPACE      TALK",
     "ENTER      TYPE",
     "1         OK",
@@ -131,8 +150,8 @@ constexpr std::array<const char*, 21> kHelpLines = {{
     "8         ON MY WAY",
     "9         REPEAT",
     "A / D      QUALITY",
-    "R / T      VL",
-    "F / G      MC",
+    "R / T      VOICE VOLUME",
+    "F / G      MIC GAIN",
     "Z / C      FX VOL",
     "X          TOGGLE FX",
     "^ / v      SCROLL",

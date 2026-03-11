@@ -37,6 +37,8 @@ class PeerManager {
 
  private:
   bool isAlive(const PeerInfo& peer, uint32_t nowMs) const;
+  bool isSelectable(const PeerInfo& peer, uint32_t nowMs) const;
+  bool hasCompatiblePeers(uint32_t nowMs) const;
   int findSlotByMac(const uint8_t* mac) const;
   int findOrAllocateSlot(uint32_t nowMs);
   int visibleToSlot(std::size_t visibleIndex, uint32_t nowMs) const;

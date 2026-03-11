@@ -48,7 +48,7 @@ struct BoardProfile {
   uint8_t speakerMagnification;
 };
 
-inline const BoardProfile& activeProfile() {
+inline const BoardProfile& cardputerProfile() {
   static constexpr BoardProfile kCardputerProfile = {
       BoardVariant::kCardputer,
       "Cardputer",
@@ -58,7 +58,10 @@ inline const BoardProfile& activeProfile() {
       255,
       24,
   };
+  return kCardputerProfile;
+}
 
+inline const BoardProfile& cardputerAdvProfile() {
   static constexpr BoardProfile kCardputerAdvProfile = {
       BoardVariant::kCardputerAdv,
       "Cardputer Adv",
@@ -68,11 +71,20 @@ inline const BoardProfile& activeProfile() {
       180,
       16,
   };
+  return kCardputerAdvProfile;
+}
+
+inline const BoardProfile& profileForVariant(BoardVariant variant) {
+  return variant == BoardVariant::kCardputerAdv ? cardputerAdvProfile()
+                                                : cardputerProfile();
+}
+
+inline const BoardProfile& activeProfile() {
 
 #if WALKIETALKIE_BOARD_VARIANT == BOARD_VARIANT_CARDPUTER_ADV
-  return kCardputerAdvProfile;
+  return cardputerAdvProfile();
 #else
-  return kCardputerProfile;
+  return cardputerProfile();
 #endif
 }
 
