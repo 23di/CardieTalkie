@@ -55,8 +55,8 @@ inline const BoardProfile& cardputerProfile() {
       "CARD",
       AudioBackendType::kM5UnifiedCodec,
       AudioPins{-1, -1, -1, -1, -1},
-      255,
-      24,
+      240,
+      20,
   };
   return kCardputerProfile;
 }
@@ -68,8 +68,8 @@ inline const BoardProfile& cardputerAdvProfile() {
       "C-ADV",
       AudioBackendType::kM5UnifiedCodec,
       AudioPins{-1, -1, -1, -1, -1},
-      180,
-      16,
+      240,
+      20,
   };
   return kCardputerAdvProfile;
 }

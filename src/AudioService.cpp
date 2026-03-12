@@ -454,11 +454,19 @@ void AudioService::handleControlPacket(const protocol::PacketHeader& header,
     remotePttActive_ = true;
     rxActiveUntilMs_ = nowMs + config::kRxActivityHoldMs;
     portEXIT_CRITICAL(&stateMux_);
+    if (board_ != nullptr) {
+      board_->beep(config::kPttStartToneHz, config::kPttStartToneMs,
+                   config::kLocalPttStartCueGainPercent);
+    }
   } else if (code == protocol::ControlCode::kPttStop) {
     portENTER_CRITICAL(&stateMux_);
     remotePttActive_ = false;
     rxActiveUntilMs_ = nowMs + config::kAudioFrameDurationMs;
     portEXIT_CRITICAL(&stateMux_);
+    if (board_ != nullptr) {
+      board_->beep(config::kPttStopToneHz, config::kPttStopToneMs,
+                   config::kLocalPttStopCueGainPercent);
+    }
   }
 }
 
@@ -701,44 +709,16 @@ void AudioService::txTaskEntry(void* context) {
             profile.frameBytes, predictor, stepIndex);
       };
 
-  auto transmitRemotePttCue =
-      [&](bool isStartCue, const config::AudioQualityProfile& profile) {
-        if (!self->board_->systemSoundsEnabled() ||
-            self->board_->effectsVolumeStep() == 0) {
-          return;
-        }
-
-        auto sendSegment = [&](uint16_t frequencyHz, uint16_t durationMs) {
-          uint32_t phaseAccumulator = 0;
-          const uint8_t frameCount =
-              frameCountForDuration(durationMs, profile.frameDurationMs);
-          for (uint8_t frameIndex = 0; frameIndex < frameCount; ++frameIndex) {
-            synthesizeToneFrame(frame, profile.frameBytes, profile.sampleRateHz,
-                                frequencyHz, phaseAccumulator);
-            applyPcmU8Gain(frame, profile.frameBytes,
-                           config::kRemotePttCueGainPercent);
-            sendEncodedFrame(frame, profile);
-            vTaskDelay(pdMS_TO_TICKS(profile.frameDurationMs));
-          }
-        };
-
-        if (isStartCue) {
-          sendSegment(config::kPttStartToneHz, config::kPttStartToneMs);
-          return;
-        }
-
-        sendSegment(config::kPttStopToneHz, config::kPttStopToneMs);
-        sendSegment(0, config::kPttToneGapMs);
-        sendSegment(config::kPttStopToneTailHz, config::kPttStopToneTailMs);
-      };
-
-  auto startSession = [&](const uint8_t* target,
-                          const config::AudioQualityProfile& qualityProfile,
-                          bool transmitAirCue) {
+  auto startSession = [&](const uint8_t* target) {
     self->clearReceiveState();
     self->board_->stopPlayback();
     self->board_->beep(config::kPttStartToneHz, config::kPttStartToneMs,
-                       config::kLocalPttCueGainPercent);
+                       config::kLocalPttStartCueGainPercent);
+    if (self->board_->systemSoundsEnabled() &&
+        self->board_->effectsVolumeStep() > 0) {
+      vTaskDelay(pdMS_TO_TICKS(config::kPttStartToneMs +
+                               config::kPttCueLeadOutMs));
+    }
 
     activeSessionId = static_cast<uint16_t>(millis() & 0xFFFF);
     if (activeSessionId == 0) {
@@ -751,20 +731,10 @@ void AudioService::txTaskEntry(void* context) {
     self->txActive_ = true;
     self->txSessionId_ = activeSessionId;
     portEXIT_CRITICAL(&self->stateMux_);
-    if (transmitAirCue) {
-      transmitRemotePttCue(true, qualityProfile);
-    }
     wasActive = true;
   };
 
-  auto finishSession = [&](const config::AudioQualityProfile& qualityProfile,
-                           bool transmitAirCue) {
-    const bool playPttCue =
-        self->board_->systemSoundsEnabled() &&
-        self->board_->effectsVolumeStep() > 0;
-    if (transmitAirCue) {
-      transmitRemotePttCue(false, qualityProfile);
-    }
+  auto finishSession = [&]() {
     self->radio_->sendControl(activeTarget, protocol::ControlCode::kPttStop,
                               activeSessionId);
     portENTER_CRITICAL(&self->stateMux_);
@@ -772,14 +742,7 @@ void AudioService::txTaskEntry(void* context) {
     portEXIT_CRITICAL(&self->stateMux_);
     self->board_->enterRxMode();
     self->board_->beep(config::kPttStopToneHz, config::kPttStopToneMs,
-                       config::kLocalPttCueGainPercent);
-    if (playPttCue) {
-      vTaskDelay(pdMS_TO_TICKS(config::kPttStopToneMs + config::kPttToneGapMs));
-      self->board_->beep(config::kPttStopToneTailHz,
-                         config::kPttStopToneTailMs,
-                         config::kLocalPttCueGainPercent);
-      vTaskDelay(pdMS_TO_TICKS(config::kPttStopToneTailMs));
-    }
+                       config::kLocalPttStopCueGainPercent);
     wasActive = false;
     activeMode = TxMode::kIdle;
     activeQuickClip = nullptr;
@@ -814,7 +777,7 @@ void AudioService::txTaskEntry(void* context) {
     const auto& qualityProfile = config::kAudioQualityProfiles[qualityIndex];
 
     if (activeMode == TxMode::kIdle && pttHeld && hasPeer) {
-      startSession(target, qualityProfile, true);
+      startSession(target);
       activeMode = TxMode::kMic;
     }
 
@@ -824,7 +787,7 @@ void AudioService::txTaskEntry(void* context) {
       self->quickClipRequested_ = false;
       portEXIT_CRITICAL(&self->stateMux_);
       if (clip != nullptr && clip->data != nullptr && clip->length > 0) {
-        startSession(target, qualityProfile, false);
+        startSession(target);
         activeQuickClip = clip;
         activeQuickClipOffset = 0;
         activeMode = TxMode::kQuickClip;
@@ -834,7 +797,7 @@ void AudioService::txTaskEntry(void* context) {
     }
 
     if (activeMode == TxMode::kIdle && !pttHeld && hasPeer && melodyRequested) {
-      startSession(target, qualityProfile, false);
+      startSession(target);
       portENTER_CRITICAL(&self->stateMux_);
       self->melodyRequested_ = false;
       portEXIT_CRITICAL(&self->stateMux_);
@@ -854,7 +817,7 @@ void AudioService::txTaskEntry(void* context) {
 
     if (activeMode == TxMode::kMic && !(pttHeld && hasPeer)) {
       if (wasActive) {
-        finishSession(qualityProfile, true);
+        finishSession();
       }
       vTaskDelay(pdMS_TO_TICKS(10));
       continue;
@@ -883,7 +846,7 @@ void AudioService::txTaskEntry(void* context) {
       frameDurationMs = qualityProfile.frameDurationMs;
     } else {
       if (activeQuickClip == nullptr || activeQuickClipOffset >= activeQuickClip->length) {
-        finishSession(qualityProfile, false);
+        finishSession();
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -921,7 +884,7 @@ void AudioService::txTaskEntry(void* context) {
     if (activeMode == TxMode::kMelody) {
       if (melodyNoteIndex >= kMelodies[activeMelodyIndex].noteCount &&
           melodySamplesRemaining == 0) {
-        finishSession(qualityProfile, false);
+        finishSession();
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -931,7 +894,7 @@ void AudioService::txTaskEntry(void* context) {
 
     if (activeMode == TxMode::kQuickClip) {
       if (activeQuickClip == nullptr || activeQuickClipOffset >= activeQuickClip->length) {
-        finishSession(qualityProfile, false);
+        finishSession();
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }

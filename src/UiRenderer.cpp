@@ -499,17 +499,17 @@ void drawFooter(const UiRenderModel& model) {
            static_cast<unsigned>(model.qualitySampleRateHz / 1000U));
   drawText(58, kFooterY + 4, line, kColorWhite, kColorBlue);
 
-  snprintf(line, sizeof(line), "VOICE %u%%",
+  snprintf(line, sizeof(line), "VOC %u%%",
            static_cast<unsigned>(model.voiceVolumePercent));
   drawText(92, kFooterY + 4, line, kColorWhite, kColorBlue);
 
   snprintf(line, sizeof(line), "MIC %u%%",
            static_cast<unsigned>(model.txGainPercent));
-  drawText(154, kFooterY + 4, line, kColorWhite, kColorBlue);
+  drawText(144, kFooterY + 4, line, kColorWhite, kColorBlue);
 
   snprintf(line, sizeof(line), "FX %s",
            model.systemSoundsEnabled ? "ON" : "OFF");
-  drawText(204, kFooterY + 4, line, kColorWhite, kColorBlue);
+  drawText(202, kFooterY + 4, line, kColorWhite, kColorBlue);
 }
 
 }  // namespace

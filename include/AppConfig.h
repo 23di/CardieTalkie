@@ -97,14 +97,12 @@ constexpr uint8_t kSpeakerVolume = 180;
 constexpr bool kEnableQuickMessageBeep = true;
 constexpr bool kBroadcastQuickMessagesEnabled = false;
 constexpr uint16_t kPttStartToneHz = 1600;
-constexpr uint16_t kPttStartToneMs = 28;
+constexpr uint16_t kPttStartToneMs = 36;
 constexpr uint16_t kPttStopToneHz = 1100;
-constexpr uint16_t kPttStopToneMs = 28;
-constexpr uint16_t kPttStopToneTailHz = 700;
-constexpr uint16_t kPttStopToneTailMs = 36;
-constexpr uint16_t kPttToneGapMs = 14;
-constexpr uint8_t kLocalPttCueGainPercent = 25;
-constexpr uint8_t kRemotePttCueGainPercent = 25;
+constexpr uint16_t kPttStopToneMs = 36;
+constexpr uint16_t kPttCueLeadOutMs = 20;
+constexpr uint8_t kLocalPttStartCueGainPercent = 20;
+constexpr uint8_t kLocalPttStopCueGainPercent = 8;
 constexpr uint8_t kMelodyTxGainPercent = 25;
 
 constexpr uint8_t kDefaultTxGainIndex = 2;
@@ -117,6 +115,7 @@ constexpr std::array<uint8_t, 5> kTxGainPercents = {{
 }};
 
 constexpr char kDeviceNamePrefix[] = "WT";
+constexpr char kAppVersion[] = "v0.2.1";
 
 static_assert(kAudioQualityProfiles[kDefaultQualityProfileIndex].frameBytes <=
                   kMaxAudioFrameBytes,
@@ -136,7 +135,7 @@ constexpr std::array<const char*, kMaxQuickMessages> kQuickMessages = {
     "Repeat",
 };
 
-constexpr std::array<const char*, 21> kHelpLines = {{
+constexpr std::array<const char*, 23> kHelpLines = {{
     "CONTROLS",
     "SPACE      TALK",
     "ENTER      TYPE",
@@ -155,6 +154,8 @@ constexpr std::array<const char*, 21> kHelpLines = {{
     "Z / C      FX VOL",
     "X          TOGGLE FX",
     "^ / v      SCROLL",
+    "",
+    "Version v0.2.1",
     "",
     "Created by Yura",
     "https://github.com/23di/CardieTalkie",
